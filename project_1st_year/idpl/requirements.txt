@@ -1,0 +1,8 @@
+numpy
+bleak
+websockets
+faster-whisper
+sounddevice
+fastapi
+uvicorn
+pyttsx3
