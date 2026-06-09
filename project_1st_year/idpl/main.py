@@ -57,7 +57,7 @@ def voice_thread_func(state, pipeline, recorder, transcriber, ble_client):
     """Continuous voice recognition loop.
     
     When voice is active:
-      1. VAD listens for speech onset
+      1. VAD listens for speech onset (with stop_flag for instant cancellation)
       2. Records until silence
       3. Whisper transcribes audio to text
       4. NLP pipeline extracts intent
@@ -70,30 +70,50 @@ def voice_thread_func(state, pipeline, recorder, transcriber, ble_client):
         if not active:
             time.sleep(0.3)
             continue
+        
+        # Update dashboard to show we're listening
+        with state.lock:
+            state.last_cmd = "🎙️ Listening…"
             
         try:
-            audio = recorder.record_utterance()
-            if audio is not None:
-                text = transcriber.transcribe(audio)
-                if text:
-                    result = pipeline.infer(text)
-                    with state.lock:
-                        state.last_raw_text = result["raw_text"]
-                        state.last_intent = result["intent"]
-                        state.last_confidence = result["confidence"]
-                        state.last_vel_extracted = result["velocity"]
-                        state.last_cmd = f"VOICE → {result['intent']}"
-                    
-                    print(f"[VOICE] \"{text}\" → {result['intent']} (conf: {result['confidence']*100:.0f}%)")
-                    
-                    # Send to robot (will silently fail if not connected)
-                    ble_payload = result["ble_payload"]
-                    try:
-                        asyncio.run(ble_client.send_command(ble_payload))
-                    except Exception as e:
-                        print(f"[VOICE] Command send error (robot not connected?): {e}")
-                else:
-                    print("[VOICE] Could not transcribe audio.")
+            # Pass stop_flag so recording aborts instantly when voice toggled off
+            def should_stop():
+                with state.lock:
+                    return not state.voice_active
+
+            audio = recorder.record_utterance(stop_flag=should_stop)
+            
+            if audio is None:
+                # Cancelled or too short
+                continue
+            
+            # Update dashboard to show we're processing
+            with state.lock:
+                state.last_cmd = "⏳ Transcribing…"
+            
+            text = transcriber.transcribe(audio)
+            
+            if text:
+                result = pipeline.infer(text)
+                with state.lock:
+                    state.last_raw_text = result["raw_text"]
+                    state.last_intent = result["intent"]
+                    state.last_confidence = result["confidence"]
+                    state.last_vel_extracted = result["velocity"]
+                    state.last_cmd = f"VOICE → {result['intent']}"
+                
+                print(f"[VOICE] \"{text}\" → {result['intent']} (conf: {result['confidence']*100:.0f}%)")
+                
+                # Send to robot (will silently fail if not connected)
+                ble_payload = result["ble_payload"]
+                try:
+                    asyncio.run(ble_client.send_command(ble_payload))
+                except Exception as e:
+                    print(f"[VOICE] Command send error (robot not connected?): {e}")
+            else:
+                print("[VOICE] Could not transcribe audio (too noisy or unclear).")
+                with state.lock:
+                    state.last_cmd = "❌ Could not transcribe"
         except Exception as e:
             print(f"[VOICE] Recording error: {e}")
             time.sleep(1)
