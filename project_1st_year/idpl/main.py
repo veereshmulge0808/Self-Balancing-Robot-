@@ -5,6 +5,12 @@ import threading
 import webbrowser
 from dataclasses import dataclass, field
 
+# Force unbuffered stdout/stderr so logs appear immediately
+# (critical when running via background process managers or agents)
+import io
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, line_buffering=True)
+sys.stderr = io.TextIOWrapper(sys.stderr.buffer, line_buffering=True)
+
 from nlp.pipeline import NLPPipeline
 from ble.client import BLEClient
 from server.ws_server import WebSocketServer
@@ -49,8 +55,8 @@ class SharedState:
     voice_active: bool = False
     lock: threading.Lock = field(default_factory=threading.Lock)
 
-def ws_thread_func(state, ble_client):
-    server = WebSocketServer(state, ble_client)
+def ws_thread_func(state, ble_client, pipeline):
+    server = WebSocketServer(state, ble_client, pipeline)
     asyncio.run(server.serve())
 
 def voice_thread_func(state, pipeline, recorder, transcriber, ble_client):
@@ -63,11 +69,15 @@ def voice_thread_func(state, pipeline, recorder, transcriber, ble_client):
       4. NLP pipeline extracts intent
       5. BLE sends command to robot (if connected)
     """
+    consecutive_errors = 0
+    MAX_CONSECUTIVE_ERRORS = 5
+
     while True:
         with state.lock:
             active = state.voice_active
         
         if not active:
+            consecutive_errors = 0  # reset error count when voice is off
             time.sleep(0.3)
             continue
         
@@ -84,7 +94,8 @@ def voice_thread_func(state, pipeline, recorder, transcriber, ble_client):
             audio = recorder.record_utterance(stop_flag=should_stop)
             
             if audio is None:
-                # Cancelled or too short
+                # Cancelled or too short — not an error
+                consecutive_errors = 0
                 continue
             
             # Update dashboard to show we're processing
@@ -92,6 +103,7 @@ def voice_thread_func(state, pipeline, recorder, transcriber, ble_client):
                 state.last_cmd = "⏳ Transcribing…"
             
             text = transcriber.transcribe(audio)
+            consecutive_errors = 0  # successful round-trip
             
             if text:
                 result = pipeline.infer(text)
@@ -104,19 +116,32 @@ def voice_thread_func(state, pipeline, recorder, transcriber, ble_client):
                 
                 print(f"[VOICE] \"{text}\" → {result['intent']} (conf: {result['confidence']*100:.0f}%)")
                 
-                # Send to robot (will silently fail if not connected)
-                ble_payload = result["ble_payload"]
-                try:
-                    asyncio.run(ble_client.send_command(ble_payload))
-                except Exception as e:
-                    print(f"[VOICE] Command send error (robot not connected?): {e}")
+                # Only send high-confidence commands to the robot
+                # Low-confidence = Whisper hallucinated on noise → don't spam STOP
+                if result["confidence"] >= 0.50:
+                    ble_payload = result["ble_payload"]
+                    ble_client.send_command_threadsafe(ble_payload)
+                else:
+                    print(f"[VOICE] Skipped — confidence too low ({result['confidence']*100:.0f}% < 50%)")
             else:
                 print("[VOICE] Could not transcribe audio (too noisy or unclear).")
                 with state.lock:
                     state.last_cmd = "❌ Could not transcribe"
         except Exception as e:
-            print(f"[VOICE] Recording error: {e}")
-            time.sleep(1)
+            consecutive_errors += 1
+            print(f"[VOICE] ERROR ({consecutive_errors}/{MAX_CONSECUTIVE_ERRORS}): {type(e).__name__}: {e}")
+            with state.lock:
+                state.last_cmd = f"❌ Voice error: {type(e).__name__}"
+
+            if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+                print("[VOICE] Too many consecutive errors — disabling voice. Toggle it back on when mic is ready.")
+                with state.lock:
+                    state.voice_active = False
+                    state.last_cmd = "❌ Voice disabled (mic error)"
+                consecutive_errors = 0
+            else:
+                # Exponential-ish backoff: 1s, 2s, 4s, ...
+                time.sleep(min(2 ** (consecutive_errors - 1), 10))
 
 def uptime_updater(state):
     start_time = time.time()
@@ -152,7 +177,6 @@ def main():
             print("[STT]  Whisper ready — voice features available.")
         except Exception as e:
             print(f"[STT]  Failed to initialize: {e}")
-            stt_available_runtime = False
             recorder = None
             transcriber = None
     else:
@@ -162,7 +186,7 @@ def main():
 
     # WebSocket — real-time dashboard communication
     print("[WS]   WebSocket server starting on ws://localhost:8765")
-    t_ws = threading.Thread(target=ws_thread_func, args=(state, ble_client), daemon=True)
+    t_ws = threading.Thread(target=ws_thread_func, args=(state, ble_client, pipeline), daemon=True)
     t_ws.start()
 
     # Voice thread

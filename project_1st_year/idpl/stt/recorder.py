@@ -22,8 +22,8 @@ class VADAudioRecorder:
         if the environment is noisy.
     """
     def __init__(self, sample_rate=16000, chunk_ms=30,
-                 energy_threshold=0.008, silence_duration_ms=700,
-                 min_speech_chunks=8, max_record_seconds=10):
+                 energy_threshold=0.05, silence_duration_ms=700,
+                 min_speech_chunks=15, max_record_seconds=5):
         if sd is None:
             raise RuntimeError(f"sounddevice unavailable: {_sd_error}")
         self.sample_rate = sample_rate
@@ -122,4 +122,8 @@ class VADAudioRecorder:
                         audio_data = np.concatenate(buffer)
                         return audio_data
         except KeyboardInterrupt:
+            return None
+        except Exception as exc:
+            # PortAudioError, device not found, ALSA errors, etc.
+            print(f"[VAD] Stream error: {exc}")
             return None

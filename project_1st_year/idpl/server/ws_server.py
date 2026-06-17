@@ -3,9 +3,10 @@ import asyncio
 import websockets
 
 class WebSocketServer:
-    def __init__(self, shared_state, ble_client, host="localhost", port=8765):
+    def __init__(self, shared_state, ble_client, pipeline, host="localhost", port=8765):
         self.state = shared_state
         self.ble_client = ble_client
+        self.pipeline = pipeline
         self.host = host
         self.port = port
         self.clients = set()
@@ -51,9 +52,7 @@ class WebSocketServer:
                         # Process typed text through NLP
                         text = data.get("text", "")
                         if text:
-                            from nlp.pipeline import NLPPipeline
-                            pipeline = NLPPipeline()
-                            result = pipeline.infer(text)
+                            result = self.pipeline.infer(text)
                             with self.state.lock:
                                 self.state.last_raw_text = result["raw_text"]
                                 self.state.last_intent = result["intent"]
@@ -61,12 +60,9 @@ class WebSocketServer:
                                 self.state.last_vel_extracted = result["velocity"]
                                 self.state.last_cmd = f"TEXT → {result['intent']}"
                             
-                            # Send to robot if connected
+                            # Send to robot — use threadsafe method (BLE runs on separate loop)
                             ble_payload = result["ble_payload"]
-                            try:
-                                await self.ble_client.send_command(ble_payload)
-                            except Exception as exc:
-                                print(f"[WS] BLE send failed (robot may not be connected): {exc}")
+                            self.ble_client.send_command_threadsafe(ble_payload)
                             print(f"[WS] NLP: \"{text}\" → {result['intent']} (conf: {result['confidence']*100:.0f}%)")
                     elif cmd == "SPEED":
                         val = data.get("val", 0.5)
@@ -75,19 +71,13 @@ class WebSocketServer:
                             self.state.last_cmd = f"MANUAL → SPEED:{val}"
                             self.state.last_intent = "SPEED"
                             self.state.last_vel_extracted = float(val)
-                        try:
-                            await self.ble_client.send_command(ble_payload)
-                        except Exception as exc:
-                            print(f"[WS] BLE send failed: {exc}")
+                        self.ble_client.send_command_threadsafe(ble_payload)
                     else:
                         # Direct movement commands: DRIVE_FORWARD, TURN_LEFT, etc.
                         with self.state.lock:
                             self.state.last_cmd = f"MANUAL → {cmd}"
                             self.state.last_intent = cmd
-                        try:
-                            await self.ble_client.send_command(cmd)
-                        except Exception as exc:
-                            print(f"[WS] BLE send failed: {exc}")
+                        self.ble_client.send_command_threadsafe(cmd)
                         print(f"[WS] Manual command: {cmd}")
         except websockets.exceptions.ConnectionClosed:
             pass

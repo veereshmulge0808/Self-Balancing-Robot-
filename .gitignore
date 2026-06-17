@@ -4,3 +4,5 @@ venv/
 node_modules/
 dist/
 .DS_Store
+bin/
+project_1st_year/Voxbot/New/
